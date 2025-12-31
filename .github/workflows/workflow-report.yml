@@ -1,0 +1,191 @@
+name: Workflow Performance Report
+
+on:
+  workflow_dispatch:  # Allow manual triggering
+  schedule:
+    - cron: '0 0 * * 1'  # Run weekly on Monday at midnight UTC
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  generate-report:
+    name: Generate Workflow Performance Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Collect workflow metrics
+        id: metrics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { repo, owner } = context.repo;
+            
+            console.log(`Collecting workflow metrics for ${owner}/${repo}...`);
+            
+            // Get all workflows
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner,
+              repo
+            });
+            
+            // Prepare metrics storage
+            const workflowMetrics = {};
+            const dateRangeStart = new Date();
+            dateRangeStart.setDate(dateRangeStart.getDate() - 30); // Last 30 days
+            
+            // Collect metrics for each workflow
+            for (const workflow of workflows.data.workflows) {
+              console.log(`Analyzing workflow: ${workflow.name} (${workflow.id})`);
+              
+              // Skip the current workflow to avoid recursion
+              if (workflow.name === 'Workflow Performance Report') {
+                continue;
+              }
+              
+              // Get recent runs
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: workflow.id,
+                created: `>${dateRangeStart.toISOString()}`
+              });
+              
+              if (runs.data.total_count === 0) {
+                console.log(`No recent runs for ${workflow.name}`);
+                continue;
+              }
+              
+              // Calculate metrics
+              const runData = runs.data.workflow_runs.map(run => ({
+                id: run.id,
+                status: run.status,
+                conclusion: run.conclusion,
+                duration: run.updated_at 
+                  ? (new Date(run.updated_at) - new Date(run.created_at)) / 1000
+                  : null,
+                created_at: run.created_at
+              }));
+              
+              // Filter for completed runs only
+              const completedRuns = runData.filter(run => 
+                run.status === 'completed' && run.duration !== null);
+              
+              if (completedRuns.length === 0) {
+                console.log(`No completed runs for ${workflow.name}`);
+                continue;
+              }
+              
+              // Calculate success rate
+              const successfulRuns = completedRuns.filter(run => 
+                run.conclusion === 'success');
+              const successRate = successfulRuns.length / completedRuns.length;
+              
+              // Calculate average duration
+              const totalDuration = completedRuns.reduce((acc, run) => 
+                acc + run.duration, 0);
+              const avgDuration = totalDuration / completedRuns.length;
+              
+              // Calculate max/min duration
+              const durations = completedRuns.map(run => run.duration);
+              const maxDuration = Math.max(...durations);
+              const minDuration = Math.min(...durations);
+              
+              // Store metrics
+              workflowMetrics[workflow.name] = {
+                id: workflow.id,
+                path: workflow.path,
+                state: workflow.state,
+                runCount: completedRuns.length,
+                successRate: successRate * 100,
+                avgDuration,
+                maxDuration,
+                minDuration,
+                lastRun: completedRuns[0]?.created_at
+              };
+            }
+            
+            // Generate markdown report
+            let markdownReport = `# Workflow Performance Report\n\n`;
+            markdownReport += `Report generated: ${new Date().toISOString()}\n\n`;
+            
+            markdownReport += `## Summary\n\n`;
+            markdownReport += `| Workflow | Runs | Success Rate | Avg Duration | Max Duration | Min Duration | Last Run |\n`;
+            markdownReport += `| -------- | ---- | ------------ | ------------ | ------------ | ------------ | -------- |\n`;
+            
+            for (const [name, metrics] of Object.entries(workflowMetrics)) {
+              markdownReport += `| ${name} | ${metrics.runCount} | ${metrics.successRate.toFixed(2)}% | ${formatTime(metrics.avgDuration)} | ${formatTime(metrics.maxDuration)} | ${formatTime(metrics.minDuration)} | ${formatDate(metrics.lastRun)} |\n`;
+            }
+            
+            // Add optimization recommendations
+            markdownReport += `\n## Optimization Recommendations\n\n`;
+            
+            // Find slowest workflow
+            const sortedByDuration = Object.entries(workflowMetrics)
+              .sort((a, b) => b[1].avgDuration - a[1].avgDuration);
+            
+            if (sortedByDuration.length > 0) {
+              const [slowestName, slowestMetrics] = sortedByDuration[0];
+              markdownReport += `- **${slowestName}**: This is the slowest workflow (${formatTime(slowestMetrics.avgDuration)}). Consider optimizing by adding caching or running steps in parallel.\n`;
+            }
+            
+            // Find least reliable workflow
+            const sortedByReliability = Object.entries(workflowMetrics)
+              .sort((a, b) => a[1].successRate - b[1].successRate);
+            
+            if (sortedByReliability.length > 0) {
+              const [leastReliableName, leastReliableMetrics] = sortedByReliability[0];
+              if (leastReliableMetrics.successRate < 95) {
+                markdownReport += `- **${leastReliableName}**: This workflow has the lowest success rate (${leastReliableMetrics.successRate.toFixed(2)}%). Consider adding retry logic or improving error handling.\n`;
+              }
+            }
+            
+            // Add general recommendations
+            markdownReport += `- Consider adding caching for node_modules in all workflows to improve performance.\n`;
+            markdownReport += `- Use matrix builds for testing across multiple environments in parallel.\n`;
+            markdownReport += `- Consider adding timeouts to all jobs to prevent hung workflows.\n`;
+            
+            // Helper functions
+            function formatTime(seconds) {
+              if (seconds < 60) return `${seconds.toFixed(0)}s`;
+              if (seconds < 3600) return `${Math.floor(seconds/60)}m ${Math.floor(seconds%60)}s`;
+              return `${Math.floor(seconds/3600)}h ${Math.floor((seconds%3600)/60)}m`;
+            }
+            
+            function formatDate(dateStr) {
+              if (!dateStr) return 'N/A';
+              const date = new Date(dateStr);
+              return date.toISOString().split('T')[0];
+            }
+            
+            // Write to file and set output
+            const fs = require('fs');
+            fs.writeFileSync('workflow-metrics.md', markdownReport);
+            
+            return { 
+              workflowCount: Object.keys(workflowMetrics).length,
+              totalRuns: Object.values(workflowMetrics).reduce((acc, m) => acc + m.runCount, 0),
+              markdownReport
+            };
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-metrics
+          path: workflow-metrics.md
+          retention-days: 90
+          
+      - name: Send metrics to summary
+        run: |
+          # Add report to GitHub step summary
+          cat workflow-metrics.md >> $GITHUB_STEP_SUMMARY
+          
+          echo "Workflow performance report generated successfully"
+          echo "Total workflows analyzed: ${{ fromJson(steps.metrics.outputs.result).workflowCount }}"
+          echo "Total runs analyzed: ${{ fromJson(steps.metrics.outputs.result).totalRuns }}"

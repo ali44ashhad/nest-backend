@@ -1,0 +1,30 @@
+/Users/amitkumar/Desktop/Freelance/Nesta-toys-Backend/precompiled_base/core/WMath.cpp.o: \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/hardware/esp32/3.3.0/cores/esp32/WMath.cpp \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_system/include/esp_system.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_err.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/newlib/platform_include/stdio.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_compiler.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_attr.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_bit_defs.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_idf_version.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/hardware/esp32/3.3.0/cores/esp32/esp32-hal-log.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_timer/include/esp_timer.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_hw_support/include/esp_etm.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_rom/esp32/include/esp32/rom/ets_sys.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_rom/include/esp_rom_sys.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/soc/esp32/include/soc/reset_reasons.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_config.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_level.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_assert.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_color.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_buffer.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_timestamp.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_write.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_format.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_args.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_macros.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_common/include/esp_assert.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_log_attr.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/log/include/esp_private/log_attr.h \
+ /Users/amitkumar/Library/Arduino15/packages/esp32/tools/esp32-arduino-libs/idf-release_v5.5-b66b5448-v1/esp32/include/esp_hw_support/include/esp_random.h

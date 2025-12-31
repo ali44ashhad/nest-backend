@@ -1,0 +1,139 @@
+name: Main CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.vscode/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        type: environment
+        default: production
+      skip_tests:
+        description: 'Skip running tests'
+        type: boolean
+        default: false
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        type: boolean
+        default: false
+
+# Concurrency control to prevent overlapping deployments
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permissions
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+jobs:
+  # Run security checks in parallel with build
+  security:
+    name: Run Security Checks
+    uses: ./.github/workflows/security-scan.yml
+    secrets: inherit
+  
+  # Run tests in parallel with build and security
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.skip_tests != 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      # Calculate cache key based on lock file
+      - name: Generate npm cache key
+        id: npm-cache-key
+        run: echo "hash=$(sha256sum package-lock.json | cut -d ' ' -f1)" >> $GITHUB_OUTPUT
+        
+      - name: Setup Node.js with optimized caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+          
+      # Use custom cache for node_modules to speed up CI
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        id: node-modules-cache
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules-${{ steps.npm-cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-node-modules-
+          
+      - name: Install dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+        
+      - name: Run tests
+        run: npm test
+        
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: coverage
+          retention-days: 7
+  
+  # Build and push image in one step (optimized)
+  build_and_push:
+    name: Build and Push Docker Image
+    uses: ./.github/workflows/build-and-push.yml
+    secrets: inherit
+  
+  # Deploy after build/push and security checks
+  deploy:
+    name: Deploy to EC2
+    needs: [build_and_push, security, tests]
+    if: |
+      success() ||
+      (github.event.inputs.force_deploy == 'true') ||
+      (needs.build_and_push.result == 'success' && github.event.inputs.skip_tests == 'true')
+    uses: ./.github/workflows/deploy-ec2.yml
+    with:
+      image_tag: commit-${{ github.sha }}
+      repository: robotics-server
+      environment: ${{ github.event.inputs.environment || 'production' }}
+    secrets: inherit
+    
+  # Post-deploy notification
+  notify:
+    name: Send Deployment Notification
+    needs: [deploy, build_and_push]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deployment Status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "✅ Deployment to ${{ github.event.inputs.environment || 'production' }} successful!"
+          else
+            echo "❌ Deployment to ${{ github.event.inputs.environment || 'production' }} failed!"
+          fi
+            
+      - name: Build Performance Metrics
+        if: ${{ needs.build_and_push.result == 'success' }}
+        run: |
+          echo "🚀 Build and push process completed successfully"
+          echo "📋 Docker image pushed to ECR with tag: commit-${{ github.sha }}"
+      
+      # Add your notification steps here (email, Slack, etc.)
+      # For example:
+      # - name: Send Slack notification
+      #   uses: slackapi/slack-github-action@v1.24.0
+      #   with:
+      #     payload: |
+      #       {"text": "Deployment status: ${{ needs.deploy.result }}"}
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

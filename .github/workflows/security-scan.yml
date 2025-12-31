@@ -1,0 +1,343 @@
+name: Security Scanning
+
+on:
+  workflow_call:  # Allows this workflow to be called from other workflows
+  workflow_dispatch:  # Allows manual triggering
+  pull_request:
+    branches: [main]  # Run full security checks on PRs
+
+env:
+  START_TIME: ${{ github.run_number }}
+
+# Set permissions
+permissions:
+  contents: read
+  actions: write  # Required for uploading artifacts
+
+jobs:
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Reduced timeout
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}  # Full history on PRs, shallow clone otherwise
+
+      - name: Setup Node.js with optimized caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          
+      # Cache node_modules based on package-lock.json
+      - name: Cache Node modules
+        id: node-modules-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-modules-
+
+      - name: Install dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+        
+      - name: Cache security tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/security-tools
+          key: ${{ runner.os }}-security-tools-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-security-tools-
+
+      # Pre-install security tools to improve performance
+      - name: Setup security scanning tools
+        run: |
+          echo "Installing security scanning tools..."
+          mkdir -p ~/.cache/security-tools
+          
+          # Install Trivy if not in cache
+          if ! command -v trivy &> /dev/null; then
+            echo "Installing Trivy scanner..."
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.43.1
+          fi
+          
+          # Install eslint-plugin-security if needed
+          if [ ! -d "node_modules/eslint-plugin-security" ]; then
+            npm install --no-save eslint-plugin-security
+          fi
+      
+      # Run security scans in parallel for better performance
+      - name: Parallel security scans
+        id: parallel-scans
+        if: github.event_name == 'push' || github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            
+            console.log('Running optimized security scans in parallel...');
+            
+            // Run npm audit in a separate process
+            const npmAuditPromise = new Promise((resolve) => {
+              try {
+                console.log('Checking for critical npm vulnerabilities...');
+                const result = execSync('npm audit --production --audit-level=critical', { encoding: 'utf8' });
+                console.log('No critical npm vulnerabilities detected.');
+                resolve({ success: true, output: result });
+              } catch (error) {
+                console.log('⚠️ CRITICAL VULNERABILITIES DETECTED!');
+                execSync('npm audit --production --audit-level=critical --json > npm-audit-results.json');
+                resolve({ success: false, output: error.stdout });
+              }
+            });
+            
+            // Run eslint security checks in a separate process
+            const eslintPromise = new Promise((resolve) => {
+              try {
+                console.log('Running security-focused ESLint checks...');
+                const eslintConfig = {
+                  extends: ['eslint:recommended'],
+                  rules: {
+                    'no-eval': 'error',
+                    'no-implied-eval': 'error',
+                    'no-new-func': 'error',
+                    'security/detect-object-injection': 'warn',
+                    'security/detect-non-literal-regexp': 'warn',
+                    'security/detect-non-literal-fs-filename': 'warn',
+                    'security/detect-eval-with-expression': 'error',
+                    'security/detect-unsafe-regex': 'warn',
+                    'security/detect-buffer-noassert': 'error',
+                    'security/detect-child-process': 'warn',
+                    'security/detect-disable-mustache-escape': 'error',
+                    'security/detect-no-csrf-before-method-override': 'error'
+                  },
+                  plugins: ['security']
+                };
+                
+                // Write config to a temp file
+                const fs = require('fs');
+                fs.writeFileSync('.eslintrc-security.json', JSON.stringify(eslintConfig));
+                
+                const result = execSync('npx eslint --quiet -c .eslintrc-security.json src/ --ignore-pattern "node_modules/"', { encoding: 'utf8' });
+                console.log('No security-focused lint issues found!');
+                resolve({ success: true, output: result });
+              } catch (error) {
+                console.log('Security-focused lint issues found!');
+                resolve({ success: false, output: error.stdout });
+              }
+            });
+            
+            // Run trivy in a separate process for container scanning
+            const trivyPromise = new Promise((resolve) => {
+              try {
+                console.log('Running Trivy filesystem scan...');
+                execSync('trivy fs --severity HIGH,CRITICAL --no-progress .', { encoding: 'utf8' });
+                console.log('No critical filesystem vulnerabilities detected.');
+                resolve({ success: true });
+              } catch (error) {
+                console.log('⚠️ Filesystem vulnerabilities detected!');
+                execSync('trivy fs --severity HIGH,CRITICAL --format json --output trivy-results.json .', { encoding: 'utf8' });
+                resolve({ success: false });
+              }
+            });
+            
+            // Wait for all scans to complete
+            const [npmAuditResult, eslintResult, trivyResult] = await Promise.all([
+              npmAuditPromise,
+              eslintPromise,
+              trivyPromise
+            ]);
+            
+            console.log('All security scans completed:');
+            console.log(`- NPM audit: ${npmAuditResult.success ? 'PASS' : 'FAIL'}`);
+            console.log(`- ESLint: ${eslintResult.success ? 'PASS' : 'FAIL'}`);
+            console.log(`- Trivy: ${trivyResult.success ? 'PASS' : 'FAIL'}`);
+            
+            return {
+              npmAudit: npmAuditResult.success,
+              eslint: eslintResult.success,
+              trivy: trivyResult.success,
+              allPassed: npmAuditResult.success && eslintResult.success && trivyResult.success
+            };
+          
+      # For PRs, run comprehensive checks with improved performance
+      - name: Comprehensive security scan for PRs
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            
+            console.log('Running comprehensive security scan for PR with parallelization...');
+            
+            // Define all security scan tasks
+            const tasks = [
+              // npm audit task
+              {
+                name: 'npm-audit',
+                run: async () => {
+                  console.log('Running full npm audit...');
+                  try {
+                    execSync('npm audit --production --json > npm-audit-results.json');
+                    return { success: true };
+                  } catch (error) {
+                    console.log('⚠️ NPM VULNERABILITIES DETECTED!');
+                    console.log('Review npm-audit-results.json for details');
+                    return { success: false, artifact: 'npm-audit-results.json' };
+                  }
+                }
+              },
+              
+              // ESLint task
+              {
+                name: 'eslint',
+                run: async () => {
+                  console.log('Running full ESLint check...');
+                  try {
+                    execSync('npm run lint', { stdio: 'inherit' });
+                    return { success: true };
+                  } catch (error) {
+                    console.log('Lint issues found! Review for security concerns.');
+                    return { success: false };
+                  }
+                }
+              },
+              
+              // Secrets scanning with Gitleaks
+              {
+                name: 'gitleaks',
+                run: async () => {
+                  if (process.env.GITLEAKS_LICENSE) {
+                    console.log('Running Gitleaks secret scanner...');
+                    try {
+                      execSync('npx gitleaks detect --source . --report-path=gitleaks-report.json');
+                      return { success: true };
+                    } catch (error) {
+                      console.log('⚠️ POTENTIAL SECRETS DETECTED!');
+                      console.log('Review gitleaks-report.json for details');
+                      return { success: false, artifact: 'gitleaks-report.json' };
+                    }
+                  } else {
+                    console.log('Skipping Gitleaks (license not available)');
+                    return { success: true, skipped: true };
+                  }
+                }
+              },
+              
+              // SonarQube SAST scan
+              {
+                name: 'sonarqube',
+                run: async () => {
+                  if (process.env.SONAR_TOKEN) {
+                    console.log('Running SonarQube SAST scan...');
+                    try {
+                      execSync('npx sonarqube-scanner');
+                      return { success: true };
+                    } catch (error) {
+                      console.log('SonarQube scan issues found!');
+                      return { success: false };
+                    }
+                  } else {
+                    console.log('Skipping SonarQube (token not available)');
+                    return { success: true, skipped: true };
+                  }
+                }
+              },
+              
+              // Trivy vulnerability scanner
+              {
+                name: 'trivy',
+                run: async () => {
+                  console.log('Running Trivy advanced vulnerability scan...');
+                  try {
+                    execSync('trivy fs --security-checks vuln,config,secret --severity HIGH,CRITICAL . --output trivy-detailed-report.json --format json');
+                    return { success: true, artifact: 'trivy-detailed-report.json' };
+                  } catch (error) {
+                    console.log('⚠️ Trivy detected security issues!');
+                    return { success: false, artifact: 'trivy-detailed-report.json' };
+                  }
+                }
+              }
+            ];
+            
+            // Run all tasks in parallel
+            console.log(`Running ${tasks.length} security scan tasks in parallel...`);
+            const results = await Promise.all(tasks.map(task => task.run()));
+            
+            // Summarize results
+            console.log('\n--- Security Scan Summary ---');
+            tasks.forEach((task, i) => {
+              const result = results[i];
+              const status = result.skipped ? 'SKIPPED' : (result.success ? 'PASSED' : 'FAILED');
+              console.log(`- ${task.name}: ${status}`);
+            });
+            
+            // Count failures
+            const failures = results.filter(r => !r.success && !r.skipped).length;
+            console.log(`\nSecurity scan complete with ${failures} failures.`);
+            
+            return { results };
+          
+      # Always run dependency check and report findings with improved output formatting
+      - name: Check for outdated dependencies
+        run: |
+          echo "Checking for outdated production dependencies..."
+          
+          # Create a formatted report with highlighted security updates
+          echo "# Dependency Status Report" > dependency-report.md
+          echo "Generated on $(date)" >> dependency-report.md
+          echo "\`\`\`" >> dependency-report.md
+          npm outdated --prod || true
+          npm outdated --prod | tee -a dependency-report.md || true
+          echo "\`\`\`" >> dependency-report.md
+          
+          # Extract security-related updates if possible
+          echo -e "\n## Security-related updates" >> dependency-report.md
+          echo "\`\`\`" >> dependency-report.md
+          npm audit fix --dry-run | grep -A 10 "Run \`npm audit fix\`" || echo "No security fixes available" >> dependency-report.md
+          echo "\`\`\`" >> dependency-report.md
+          
+          echo "Dependency check complete. Report saved to dependency-report.md"
+          
+      # Upload all security scan results with improved organization
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-scan-results
+          path: |
+            npm-audit-results.json
+            gitleaks-report.json
+            trivy-results.json
+            trivy-detailed-report.json
+            dependency-report.md
+          retention-days: 7
+          if-no-files-found: ignore
+          
+      # Add performance metrics for scan duration
+      - name: Record scan metrics
+        if: always()
+        run: |
+          # Record current time
+          END_TIME=$(date +%s)
+          
+          # Use step start time from created workflow marker
+          START_TIME_FILE="/tmp/scan_start_time"
+          
+          # Create start time file if it doesn't exist (first run)
+          if [ ! -f "$START_TIME_FILE" ]; then
+            date +%s > "$START_TIME_FILE"
+          fi
+          
+          # Read the start time
+          START_TIME=$(cat "$START_TIME_FILE")
+          SCAN_DURATION=$((END_TIME - START_TIME))
+          
+          echo "scan_duration=$SCAN_DURATION" >> $GITHUB_OUTPUT
+          echo "Security scan completed in $SCAN_DURATION seconds"

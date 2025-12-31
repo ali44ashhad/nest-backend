@@ -1,0 +1,465 @@
+name: Deploy to EC2
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "The image tag to deploy"
+        required: true
+        type: string
+      repository:
+        description: "The ECR repository name"
+        required: true
+        type: string
+      environment:
+        description: "The environment to deploy to"
+        required: false
+        default: "production"
+        type: string
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "The image tag to deploy"
+        required: true
+        type: string
+      repository:
+        description: "The ECR repository name"
+        required: true
+        default: "robotics-server"
+        type: string
+      environment:
+        description: "The environment to deploy to"
+        required: false
+        default: "production"
+        type: string
+
+# Permissions needed for deployment
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 15
+    
+    steps:
+      - name: Create container deployment script on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true  # Stop on first error
+          script: |
+            # Create deployment directory if it doesn't exist
+            mkdir -p /home/ubuntu/robotics-deploy
+            
+            # ===============================================================
+            # ALTERNATIVE APPROACH: Deploy directly with Docker instead of Docker Compose
+            # This avoids all YAML parsing issues
+            # ===============================================================
+            
+            echo "🔄 Using direct Docker commands instead of Docker Compose"
+            
+            # Create a directory for the cache volume
+            mkdir -p /home/ubuntu/robotics-deploy/cache
+            
+            # Generate the deployment script content
+            cat > /home/ubuntu/robotics-deploy/start-container.sh << 'EOF'
+            #!/bin/bash
+            set -e
+                    
+            # Load environment variables
+            source .env
+                    
+            # Stop and remove existing container if it exists
+            echo "Stopping existing container if running..."
+            docker stop robotics-server-container 2>/dev/null || true
+            docker rm robotics-server-container 2>/dev/null || true
+                    
+            # Make sure we have required values
+            if [ -z "${ECR_REGISTRY}" ] || [ -z "${ECR_REPOSITORY}" ] || [ -z "${IMAGE_TAG}" ]; then
+              echo "Error: Missing required environment variables. Check .env file."
+              env | grep -E 'ECR_|IMAGE_TAG'
+              exit 1
+            fi
+                    
+            # Debug information
+            echo "Using image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    
+            # Run the container with all the same parameters we would use in docker-compose
+            echo "Starting container..."
+            docker run -d \
+              --name robotics-server-container \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e DB_USER="${DB_USER}" \
+              -e DB_HOST="${DB_HOST}" \
+              -e DB_DATABASE="${DB_DATABASE}" \
+              -e DB_PASSWORD="${DB_PASSWORD}" \
+              -e DB_PORT="${DB_PORT}" \
+              -e SSL="${SSL}" \
+              -e JWT_SECRET="${JWT_SECRET}" \
+              -e JWT_EXPIRATION="${JWT_EXPIRATION}" \
+              -e PORT="${PORT}" \
+              -e NODE_ENV="${NODE_ENV}" \
+              -e CORS_ORIGIN="${CORS_ORIGIN}" \
+              -e COMPILATION_CACHE_SIZE=100 \
+              -e COMPILATION_CACHE_TTL=3600 \
+              -e OPTIMIZE_COMPILATION=true \
+              -e COMPILATION_THREADS=2 \
+              -v "$(pwd)/cache:/usr/src/app/cache" \
+              --security-opt no-new-privileges:true \
+              --user node \
+              --health-cmd "curl -f http://localhost:3000/health || wget -q --spider http://localhost:3000/health || exit 1" \
+              --health-interval=15s \
+              --health-timeout=15s \
+              --health-retries=5 \
+              --health-start-period=30s \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --cpus=1 \
+              --memory=1g \
+              ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+                    
+            echo "Container started"
+            EOF
+            
+            # Make the script executable
+            chmod +x /home/ubuntu/robotics-deploy/start-container.sh
+            
+            # Display the generated script for debugging
+            echo "Generated deployment script:"
+            cat /home/ubuntu/robotics-deploy/start-container.sh
+
+      - name: Deploy to EC2 via Docker
+        id: deploy
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true  # Stop on first error
+          script: |
+            # Set variables
+            export IMAGE_TAG=${{ inputs.image_tag }}
+            export ECR_REPOSITORY=${{ inputs.repository }}
+            export ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+            
+            # Ensure we have curl installed for health checks
+            if ! command -v curl &> /dev/null; then
+                echo "Installing curl for health checks..."
+                sudo apt-get update && sudo apt-get install -y curl
+            fi
+            
+            # Log in to ECR with retry logic
+            max_attempts=3
+            attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt/$max_attempts: Logging into ECR..."
+              if aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+                 docker login --username AWS --password-stdin $ECR_REGISTRY; then
+                echo "Successfully logged in to ECR"
+                break
+              else
+                echo "Failed to log in to ECR"
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "Max attempts reached. Exiting."
+                  exit 1
+                fi
+                sleep 5
+                attempt=$((attempt+1))
+              fi
+            done
+            
+            # Pull image with retry logic
+            max_attempts=3
+            attempt=1
+            echo "Pulling image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt/$max_attempts: Pulling image..."
+              if docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG; then
+                echo "Successfully pulled image"
+                break
+              else
+                echo "Failed to pull image"
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "Max attempts reached. Exiting."
+                  exit 1
+                fi
+                sleep 5
+                attempt=$((attempt+1))
+              fi
+            done
+            
+            # Create env file with direct variable assignments
+            echo "DB_USER=${{ secrets.DB_USER }}" > /home/ubuntu/robotics-deploy/.env
+            echo "DB_HOST=${{ secrets.DB_HOST }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_DATABASE=${{ secrets.DB_DATABASE }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_PORT=${{ secrets.DB_PORT }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "SSL=${{ secrets.SSL }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "JWT_EXPIRATION=${{ secrets.JWT_EXPIRATION }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "PORT=${{ secrets.PORT }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "NODE_ENV=${{ secrets.NODE_ENV }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "ECR_REGISTRY=$ECR_REGISTRY" >> /home/ubuntu/robotics-deploy/.env
+            echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> /home/ubuntu/robotics-deploy/.env
+            echo "IMAGE_TAG=$IMAGE_TAG" >> /home/ubuntu/robotics-deploy/.env
+            
+            # Display the env file for debugging (with passwords redacted)
+            echo "Generated .env file (redacted):"
+            grep -v 'PASSWORD\|SECRET' /home/ubuntu/robotics-deploy/.env
+            
+            # Robustly ensure Docker Compose is installed (either plugin or standalone)
+            if ! (docker compose version &> /dev/null || docker-compose --version &> /dev/null); then
+              echo "🔧 Docker Compose not found, installing..."
+              
+              # First try to install the Docker Compose plugin (preferred modern approach)
+              echo "Installing Docker Compose plugin..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker-compose-plugin || true
+              
+              # Check if installation worked
+              if ! docker compose version &> /dev/null; then
+                echo "Plugin installation failed, trying standalone docker-compose installation..."
+                # Install standalone docker-compose
+                sudo curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+                sudo chmod +x /usr/local/bin/docker-compose
+                
+                # Verify installation
+                if ! docker-compose --version &> /dev/null; then
+                  echo "Error: Docker Compose installation failed"
+                  exit 1
+                else
+                  echo "Standalone Docker Compose installed successfully"
+                  docker-compose --version
+                fi
+              else
+                echo "Docker Compose plugin installed successfully"
+                docker compose version
+              fi
+            else
+              echo "✅ Docker Compose is already installed"
+              docker compose version 2>/dev/null || docker-compose --version
+            fi
+            
+            # Move to deploy directory and run the container directly
+            cd /home/ubuntu/robotics-deploy
+            
+            # Output the environment (redacted)
+            echo "Environment variables (sensitive values redacted):"
+            env | grep -E 'ECR_|PORT|NODE_ENV|CORS_' | sort
+            
+            # Execute the deployment script
+            echo "Starting deployment with direct Docker commands..."
+            set +e  # Don't exit on error for better diagnostics
+            
+            # Print the environment variables for debugging (redacted)
+            echo "Environment variables for deployment (sensitive values redacted):"
+            env | grep -E 'ECR_|IMAGE_TAG' | sort
+            
+            # Verify that the image exists
+            echo "Verifying image exists:"
+            docker images | grep "$ECR_REPOSITORY" | grep "$IMAGE_TAG" || echo "⚠️ Image not found!"
+            
+            # Execute with more detailed error handling
+            echo "Executing start-container.sh..."
+            bash -x ./start-container.sh
+            STATUS=$?
+            
+            if [ $STATUS -eq 0 ]; then
+              echo "✅ Container deployment successful"
+            else
+              echo "❌ Container deployment failed with exit code $STATUS"
+              echo "Manual command to reproduce:"
+              echo "cd /home/ubuntu/robotics-deploy && bash -x ./start-container.sh"
+              echo "Checking script content:"
+              cat ./start-container.sh
+              echo "Checking .env file (redacted):"
+              grep -v 'PASSWORD\|SECRET' ./.env
+              exit 1
+            fi
+            
+            # Re-enable exit on error
+            set -e
+            
+            # Wait a moment for the container to start
+            echo "Waiting for container to start..."
+            sleep 5
+            
+            # Minimal cleanup of Docker resources on EC2 (focused on deployment)
+            echo "Performing minimal Docker cleanup..."
+            
+            # 1. Save the currently used image ID to ensure we don't remove it
+            CURRENT_IMAGE_ID=$(docker inspect $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f '{{.Id}}')
+            echo "Current image ID: $CURRENT_IMAGE_ID (will be preserved)"
+            
+            # 2. Remove stopped containers (safe cleanup)
+            echo "Removing stopped containers..."
+            docker container prune -f
+            
+            # 3. Remove dangling images (untagged images)
+            echo "Removing dangling images..."
+            docker image prune -f
+            
+            # 4. Remove old robotics-server images but keep the current one and 4 most recent (5 total)
+            echo "Removing old robotics-server images..."
+            
+            # First list all images for debugging
+            echo "Current images before cleanup:"
+            docker images | grep $ECR_REPOSITORY
+            
+            # Simplify the approach to avoid bash arrays which might not be available in all environments
+            echo "Keeping the current image and 4 most recent ones (5 total)"
+            
+            # Keep a count of how many images we've seen and saved
+            saved_count=0
+            max_to_keep=5
+            
+            # Process images one by one, newest first
+            for img in $(docker images --format "{{.ID}} {{.Repository}} {{.CreatedAt}}" | grep $ECR_REPOSITORY | sort -k 3 -r | awk '{print $1}'); do
+              if [ "$saved_count" -lt "$max_to_keep" ] || [ "$img" == "$CURRENT_IMAGE_ID" ]; then
+                echo "Preserving image: $img"
+                saved_count=$((saved_count + 1))
+              else
+                echo "Removing old image: $img"
+                docker rmi -f "$img" || true
+              fi
+            done
+            
+            # 5. Clean other unused images older than 24 hours
+            echo "Cleaning unused images older than 24 hours..."
+            docker image prune -a -f --filter "until=24h"
+            
+            # 6. Remove unused volumes
+            echo "Removing unused volumes..."
+            docker volume prune -f
+            
+            # 7. Remove unused networks
+            echo "Removing unused networks..."
+            docker network prune -f
+            
+            # 8. Show disk usage after cleanup
+            echo "Disk usage after cleanup:"
+            df -h
+
+
+      - name: Verify Deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Wait for container to be healthy with a progress indicator
+            attempts=0
+            max_attempts=20  # Increased from 12 to 20
+            interval=15      # Increased from 10 to 15 seconds
+            echo "Checking container health status..."
+            
+            # First, make sure the container is running
+            if [ "$(docker inspect --format='{{.State.Status}}' robotics-server-container 2>/dev/null)" != "running" ]; then
+              echo "❌ Container is not running. Checking logs..."
+              docker logs robotics-server-container
+              exit 1
+            fi
+            
+            echo "✅ Container is running. Waiting for it to become healthy..."
+            
+            # Check directly with curl for more diagnostic information
+            curl -v http://localhost:3000/health || true
+            
+            until [ "$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null)" == "healthy" ] || [ $attempts -eq $max_attempts ]; do
+              attempts=$((attempts+1))
+              progress=$(printf '%*s' $attempts | tr ' ' '#')
+              empty=$(printf '%*s' $((max_attempts - attempts)) | tr ' ' '.')
+              echo -ne "Waiting for container to be healthy [$progress$empty] ($attempts/$max_attempts)\r"
+              sleep $interval
+              
+              # At regular intervals, check health and logs
+              if [ $((attempts % 5)) -eq 0 ]; then
+                echo -e "\nContainer status at attempt $attempts:"
+                docker inspect --format='{{.State.Status}}' robotics-server-container
+                health_status=$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null || echo "No health data yet")
+                echo "Health status: $health_status"
+                
+                # If the health check is failing, get detailed logs
+                if [ "$health_status" == "starting" ] || [ "$health_status" == "unhealthy" ]; then
+                  echo "Recent health check output:"
+                  docker inspect --format='{{range .State.Health.Log}}{{println .Output}}{{end}}' robotics-server-container | tail -3
+                  
+                  # Try a direct curl to see what's happening
+                  echo "Direct health check:"
+                  curl -v http://localhost:3000/health || true
+                fi
+                
+                echo "Recent container logs:"
+                docker logs --tail 20 robotics-server-container
+              fi
+            done
+            echo # Add a newline after progress indicator
+            
+            # Check if the container became healthy
+            if [ "$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null)" != "healthy" ]; then
+              echo "❌ Container failed to become healthy. Deployment failed."
+              echo "Container status:"
+              docker inspect --format='{{.State.Status}}' robotics-server-container
+              echo "Health status: $(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null || echo 'No health data')"
+              
+              # Get detailed health check logs
+              echo "Health check history:"
+              docker inspect --format='{{range .State.Health.Log}}{{println .Output}}{{end}}' robotics-server-container | tail -5
+              
+              # Test the health endpoint directly for diagnostics
+              echo "Testing health endpoint directly:"
+              curl -v http://localhost:3000/health || echo "Health endpoint test failed with curl"
+              wget -S -O /dev/null http://localhost:3000/health 2>&1 || echo "Health endpoint test failed with wget"
+              
+              # Get container logs
+              echo "Recent container logs:"
+              docker logs --tail 50 robotics-server-container
+              
+              # Check port binding
+              echo "Port binding:"
+              netstat -tulpn | grep 3000 || echo "Port 3000 not bound"
+              
+              # Install jq if needed for better diagnostics
+              if ! command -v jq &>/dev/null; then
+                apt-get update && apt-get install -y jq || true
+              fi
+              
+              # Get full container inspection with jq if available
+              if command -v jq &> /dev/null; then
+                echo "Full container health inspection:"
+                docker inspect robotics-server-container | jq '.[0].State.Health' || echo "Could not get detailed health info"
+              fi
+              
+              exit 1
+            fi
+            
+            echo "✅ Container is healthy!"
+            
+            echo "✅ Deployment successful. Container is healthy."
+            docker ps
+            
+            # Monitor resource usage
+            echo "Current resource usage:"
+            docker stats robotics-server-container --no-stream
+            
+            # Report disk space usage
+            echo -e "\n📊 Disk space usage after cleanup:"
+            df -h
+            
+            # Report Docker image count
+            echo -e "\n🐳 Remaining Docker images:"
+            docker images | grep -v "REPOSITORY" | wc -l
+            
+            # Report specific images related to our application
+            echo -e "\n📋 Application images:"
+            docker images | grep robotics-server

@@ -1,0 +1,9 @@
+/node_modules
+dist/
+.DS_Store
+!.env.example
+coverage/
+*.log
+temp_builds/
+temp_sketches/
+config.bat

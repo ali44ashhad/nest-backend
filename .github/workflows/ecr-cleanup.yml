@@ -1,0 +1,173 @@
+name: Clean ECR Images
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "The image tag to preserve during cleanup"
+        required: true
+        type: string
+      repository:
+        description: "The ECR repository name"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "The image tag to preserve during cleanup"
+        required: true
+        type: string
+      repository:
+        description: "The ECR repository name"
+        required: true
+        default: "robotics-server"
+        type: string
+
+# Permissions needed for AWS operations
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cleanup:
+    name: Clean up ECR Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Clean up old ECR images
+        run: |
+          echo "Cleaning up old images from ECR..."
+          
+          # Set repository name and logging function
+          REPO=${{ inputs.repository }}
+          IMAGE_TAG=${{ inputs.image_tag }}
+          ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          
+          # Helper functions for better logging and error handling
+          log_info() {
+            echo "ℹ️ INFO: $1"
+          }
+          
+          log_warning() {
+            echo "⚠️ WARNING: $1"
+          }
+          
+          log_error() {
+            echo "❌ ERROR: $1"
+          }
+          
+          log_success() {
+            echo "✅ SUCCESS: $1"
+          }
+          
+          retry_command() {
+            local -r cmd="$1"
+            local -r max_attempts="$2"
+            local -r delay="$3"
+            local -r description="$4"
+            local attempt=1
+            local output=""
+            
+            log_info "Attempting: $description"
+            
+            while [ $attempt -le $max_attempts ]; do
+              log_info "Attempt $attempt of $max_attempts: $description"
+              output=$(eval "$cmd" 2>&1) && {
+                log_success "$description completed successfully"
+                echo "$output"
+                return 0
+              } || {
+                local exit_code=$?
+                log_warning "$description failed (exit code: $exit_code)"
+                if [ $attempt -eq $max_attempts ]; then
+                  log_error "Maximum retry attempts reached for: $description"
+                  return $exit_code
+                fi
+                log_info "Retrying in $delay seconds..."
+                sleep $delay
+                attempt=$((attempt + 1))
+              }
+            done
+          }
+          
+          # Get the current image digest (to protect it)
+          log_info "Getting digest for image tag: $IMAGE_TAG"
+          CURRENT_DIGEST=$(aws ecr describe-images \
+            --repository-name $REPO \
+            --image-ids imageTag=$IMAGE_TAG \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo "none")
+          
+          if [ "$CURRENT_DIGEST" == "none" ]; then
+            log_warning "Could not find digest for image tag $IMAGE_TAG. Will proceed with cleanup but may not be able to protect the image."
+          else
+            log_info "Current image digest: $CURRENT_DIGEST (will be preserved)"
+          fi
+          
+          # Get all image digests, sorted by push date with retry logic
+          IMAGE_DIGESTS=$(retry_command "aws ecr describe-images \
+            --repository-name $REPO \
+            --query 'sort_by(imageDetails,& imagePushedAt)[*].imageDigest' \
+            --output text 2>/dev/null || echo ''" 3 5 "Retrieving ECR image information")
+          
+          if [ -z "$IMAGE_DIGESTS" ]; then
+            log_warning "No images found in the repository or unable to retrieve them. Skipping cleanup."
+            exit 0
+          fi
+          
+          log_success "Successfully retrieved ECR image information."
+          
+          # Convert to array
+          IFS=$'\t' read -r -a IMAGE_DIGESTS_ARR <<< "$IMAGE_DIGESTS"
+          
+          # Calculate how many to remove (keep latest 5)
+          TOTAL=${#IMAGE_DIGESTS_ARR[@]}
+          TO_KEEP=5
+          
+          if [ $TOTAL -gt $TO_KEEP ]; then
+            # Calculate how many to remove
+            TO_REMOVE=$((TOTAL - TO_KEEP))
+            
+            echo "Found $TOTAL images, keeping newest $TO_KEEP, removing $TO_REMOVE old images"
+            
+            # Loop through older images and delete them
+            deleted_count=0
+            for ((i=0; i<$TO_REMOVE; i++)); do
+              DIGEST=${IMAGE_DIGESTS_ARR[$i]}
+              
+              # Skip current image if it's in the removal list
+              if [ -n "$CURRENT_DIGEST" ] && [ "$DIGEST" == "$CURRENT_DIGEST" ]; then
+                echo "Skipping current image: $DIGEST"
+                continue
+              fi
+              
+              echo "Removing image with digest: $DIGEST"
+              
+              # Delete the image
+              if aws ecr batch-delete-image \
+                --repository-name $REPO \
+                --image-ids imageDigest=$DIGEST > /dev/null 2>&1; then
+                echo "Successfully deleted image $DIGEST"
+                deleted_count=$((deleted_count + 1))
+              else
+                echo "Failed to delete image $DIGEST, continuing..."
+              fi
+            done
+            
+            echo "Cleanup complete. Deleted $deleted_count of $TO_REMOVE targeted images."
+          else
+            echo "Only $TOTAL images found, keeping all (minimum keep count is $TO_KEEP)"
+          fi

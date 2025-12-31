@@ -1,0 +1,339 @@
+name: Scheduled Cleanup
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Runs every day at midnight UTC
+  workflow_dispatch:  # Allows manual triggering
+
+# Permissions needed for AWS operations
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ECR_REPOSITORY: robotics-server
+
+jobs:
+  ecr-cleanup:
+    name: Clean ECR Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Aggressive ECR Cleanup
+        run: |
+          echo "🧹 Performing aggressive ECR cleanup..."
+          
+          # Set repository name
+          REPO=${{ env.ECR_REPOSITORY }}
+          ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          
+          # Helper functions for better logging and error handling
+          function log_step() { echo "➡️ $1"; }
+          function log_success() { echo "✅ $1"; }
+          function log_warning() { echo "⚠️ $1"; }
+          function log_error() { echo "❌ $1"; }
+          
+          # Function to retry commands with backoff
+          function retry_with_backoff() {
+            local max_attempts=$1
+            local command=$2
+            local attempt=1
+            local backoff=5
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "⏳ Attempt $attempt/$max_attempts..."
+              
+              # Execute the command and capture output
+              if output=$($command 2>&1); then
+                echo "$output"
+                return 0
+              fi
+              
+              log_warning "Attempt $attempt failed. Retrying in ${backoff}s..."
+              sleep $backoff
+              
+              # Exponential backoff
+              backoff=$((backoff * 2))
+              attempt=$((attempt + 1))
+            done
+            
+            log_error "Command failed after $max_attempts attempts"
+            return 1
+          }
+          
+          # Get important images to protect
+          log_step "Identifying important images to protect..."
+          
+          # Track multiple important digests to protect
+          declare -a PROTECTED_DIGESTS=()
+          
+          # Get the 'latest' tag digest
+          log_step "Checking 'latest' tag..."
+          LATEST_DIGEST=$(retry_with_backoff 3 "aws ecr describe-images \
+            --repository-name $REPO \
+            --image-ids imageTag=latest \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo 'none'")
+          
+          if [ "$LATEST_DIGEST" != "none" ]; then
+            log_success "Latest tag digest: $LATEST_DIGEST (will be preserved)"
+            PROTECTED_DIGESTS+=("$LATEST_DIGEST")
+          else
+            log_warning "No 'latest' tag found"
+          fi
+          
+          # Get the 'main' tag digest if it exists
+          log_step "Checking 'main' tag..."
+          MAIN_DIGEST=$(retry_with_backoff 3 "aws ecr describe-images \
+            --repository-name $REPO \
+            --image-ids imageTag=main \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo 'none'")
+          
+          if [ "$MAIN_DIGEST" != "none" ]; then
+            log_success "Main branch tag digest: $MAIN_DIGEST (will be preserved)"
+            PROTECTED_DIGESTS+=("$MAIN_DIGEST")
+          else
+            log_warning "No 'main' tag found"
+          fi
+          
+          log_step "Retrieving all ECR image information..."
+          
+          # Install jq if it's not available
+          if ! command -v jq &> /dev/null; then
+            log_step "Installing jq..."
+            apt-get update && apt-get install -y jq || {
+              log_error "Failed to install jq. Cannot process ECR data."
+              exit 1
+            }
+          fi
+          
+          # Get all image details with retry
+          IMAGE_DETAILS=$(retry_with_backoff 3 "aws ecr describe-images \
+            --repository-name $REPO \
+            --query 'imageDetails[*].[imageDigest,imageTags,imagePushedAt,imageSizeInBytes]' \
+            --output json 2>/dev/null || echo '[]'")
+            
+          # Check if we got any image details
+          if [ "$IMAGE_DETAILS" == "[]" ]; then
+            log_warning "No images found in repository. Nothing to clean up."
+            exit 0
+          fi
+          
+          # Calculate total storage
+          TOTAL_SIZE=$(echo "$IMAGE_DETAILS" | jq -r '[.[].[-1] | tonumber] | add')
+          TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+          
+          log_step "ECR repository contains $(echo "$IMAGE_DETAILS" | jq -r 'length') images using ${TOTAL_SIZE_MB}MB"
+          
+          # Keep the 10 most recent images and any protected tags
+          log_step "Identifying images older than 7 days for deletion..."
+          
+          # Current date in seconds
+          CURRENT_DATE=$(date +%s)
+          
+          # Build jq filter to protect multiple digests
+          FILTER_ARGS=""
+          for digest in "${PROTECTED_DIGESTS[@]}"; do
+            FILTER_ARGS="$FILTER_ARGS --arg protected_$digest \"$digest\""
+          done
+          
+          # Create jq filter expression for protected digests
+          PROTECTED_FILTER="false"
+          for digest in "${PROTECTED_DIGESTS[@]}"; do
+            if [ -z "$PROTECTED_FILTER" ]; then
+              PROTECTED_FILTER=".[0] == \$protected_$digest"
+            else
+              PROTECTED_FILTER="$PROTECTED_FILTER or .[0] == \$protected_$digest"
+            fi
+          done
+          
+          # If no protected digests, use a simple filter
+          if [ ${#PROTECTED_DIGESTS[@]} -eq 0 ]; then
+            PROTECTED_FILTER="false"
+          fi
+          
+          # Use jq to filter and prepare batch deletion command - more efficient
+          JQ_COMMAND="[sort_by(.[2]) | .[] | select(
+            # Convert ISO date to timestamp in seconds
+            ((\$now | tonumber) - (.[2] | sub(\"\\\\.[0-9]+Z$\"; \"Z\") | fromdateiso8601 | tostring | tonumber)) > 604800 and 
+            !($PROTECTED_FILTER) and
+            (.[1] | index(\"latest\") | not) and
+            (.[1] | index(\"main\") | not)
+          ) | {imageDigest: .[0]}]"
+          
+          # Generate a JSON file with image digests to delete in batches (more efficient)
+          echo "$IMAGE_DETAILS" | jq --arg now "$CURRENT_DATE" "$JQ_COMMAND" > /tmp/digests_to_delete.json
+          
+          # Get count of images to delete
+          DELETE_COUNT=$(jq length /tmp/digests_to_delete.json)
+          
+          # Delete the old images
+          if [ "$DELETE_COUNT" -eq 0 ]; then
+            log_success "No old images to delete"
+          else
+            log_step "Deleting $DELETE_COUNT old images from ECR..."
+            
+            # Use batching for more efficient deletion (max 100 images per batch)
+            BATCH_SIZE=100
+            TOTAL_BATCHES=$(( (DELETE_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
+            
+            DELETED_COUNT=0
+            FAILED_COUNT=0
+            
+            for ((i=0; i<TOTAL_BATCHES; i++)); do
+              START=$((i * BATCH_SIZE))
+              END=$((START + BATCH_SIZE))
+              
+              # Extract current batch of digests
+              jq ".[${START}:${END}]" /tmp/digests_to_delete.json > /tmp/current_batch.json
+              BATCH_COUNT=$(jq length /tmp/current_batch.json)
+              
+              log_step "Processing batch $((i+1))/$TOTAL_BATCHES with $BATCH_COUNT images..."
+              
+              # List the first few digests being deleted in this batch
+              SAMPLE_DIGESTS=$(jq -r '.[0:3] | map(.imageDigest[0:12]) | join(", ")' /tmp/current_batch.json)
+              if [ -n "$SAMPLE_DIGESTS" ]; then
+                log_step "Sample digests: $SAMPLE_DIGESTS..."
+              fi
+              
+              # Execute batch deletion
+              if aws ecr batch-delete-image \
+                 --repository-name $REPO \
+                 --image-ids file:///tmp/current_batch.json >/dev/null 2>&1; then
+                DELETED_COUNT=$((DELETED_COUNT + BATCH_COUNT))
+                echo "✅ Batch $((i+1)) deleted successfully"
+              else
+                FAILED_COUNT=$((FAILED_COUNT + BATCH_COUNT))
+                log_warning "Failed to delete batch $((i+1))"
+                else
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
+                  log_warning "Failed to delete"
+                fi
+              fi
+            done
+            
+            log_success "Cleanup complete. Successfully deleted $DELETED_COUNT images, failed to delete $FAILED_COUNT."
+          fi
+          
+          # Get updated repository size
+          log_step "Checking updated repository size..."
+          UPDATED_DETAILS=$(retry_with_backoff 3 "aws ecr describe-images \
+            --repository-name $REPO \
+            --query 'imageDetails[*].imageSizeInBytes' \
+            --output json 2>/dev/null || echo '[]'")
+          
+          if [ "$UPDATED_DETAILS" != "[]" ]; then
+            NEW_TOTAL_SIZE=$(echo "$UPDATED_DETAILS" | jq -r 'add')
+            NEW_TOTAL_SIZE_MB=$(echo "scale=2; $NEW_TOTAL_SIZE / 1024 / 1024" | bc)
+            SAVED_MB=$(echo "scale=2; $TOTAL_SIZE_MB - $NEW_TOTAL_SIZE_MB" | bc)
+            
+            log_success "ECR cleanup complete. Repository now uses ${NEW_TOTAL_SIZE_MB}MB (saved ${SAVED_MB}MB)"
+          else
+            log_success "ECR cleanup complete."
+          fi
+          
+          echo "ECR cleanup completed"
+          
+  ec2-cleanup:
+    name: Clean EC2 Docker Resources
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production  # Use the environment that has EC2 secrets
+    
+    steps:
+      - name: Perform Deep Cleanup on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            echo "Performing comprehensive Docker cleanup on EC2..."
+            
+            # Get the current running container ID to protect it
+            CURRENT_CONTAINER_ID=$(docker ps --filter "name=robotics-server-container" --quiet)
+            
+            if [ -n "$CURRENT_CONTAINER_ID" ]; then
+              CURRENT_IMAGE_ID=$(docker inspect --format='{{.Image}}' $CURRENT_CONTAINER_ID)
+              echo "Current container is using image ID: $CURRENT_IMAGE_ID (will be preserved)"
+            else
+              echo "Warning: No running container found with name 'robotics-server-container'"
+              CURRENT_IMAGE_ID="none"
+            fi
+            
+            # 1. Remove all stopped containers
+            echo "Removing stopped containers..."
+            docker container prune -f
+            
+            # 2. Remove dangling images
+            echo "Removing dangling images..."
+            docker image prune -f
+            
+            # 3. Record system stats before cleanup
+            echo "Recording system stats before cleanup..."
+            BEFORE_SPACE=$(df -h / | awk 'NR==2 {print $4}')
+            BEFORE_IMAGES=$(docker images -q | wc -l)
+            
+            # 4. Deep clean - remove all unused images older than 7 days, except current image
+            echo "Removing all unused images older than 7 days..."
+            docker image prune -a -f --filter "until=168h" --filter "label!=com.docker.compose.version"
+            
+            # 5. More efficient removal of robotics-server images using label filtering
+            echo "Cleaning old robotics-server images..."
+            # Get list of images to delete
+            IMAGES_TO_DELETE=$(docker images --format "{{.ID}}" --filter "reference=*robotics-server*" | grep -v "$CURRENT_IMAGE_ID")
+            
+            # Count images to delete
+            DELETE_COUNT=$(echo "$IMAGES_TO_DELETE" | grep -v "^$" | wc -l)
+            echo "Found $DELETE_COUNT old robotics-server images to clean up"
+            
+            # Delete in one operation if possible
+            if [ -n "$IMAGES_TO_DELETE" ]; then
+              echo "$IMAGES_TO_DELETE" | xargs -r docker rmi -f 2>/dev/null || echo "Some images could not be removed (may be in use)"
+            fi
+            
+            # 5. Remove all unused volumes
+            echo "Removing unused volumes..."
+            docker volume prune -f
+            
+            # 6. Remove unused networks
+            echo "Removing unused networks..."
+            docker network prune -f
+            
+            # Report system status after cleanup with detailed metrics
+            AFTER_SPACE=$(df -h / | awk 'NR==2 {print $4}')
+            AFTER_IMAGES=$(docker images -q | wc -l)
+            
+            # Calculate differences
+            IMAGES_REMOVED=$((BEFORE_IMAGES - AFTER_IMAGES))
+            
+            echo -e "\n📊 Cleanup Results Summary:"
+            echo "- Removed $IMAGES_REMOVED Docker images"
+            echo "- Before cleanup: $BEFORE_SPACE disk space available"
+            echo "- After cleanup: $AFTER_SPACE disk space available"
+            
+            # Get detailed system stats
+            echo -e "\n📊 Current disk space:"
+            df -h
+            
+            echo -e "\n🐳 Docker system status:"
+            docker system df --verbose | grep -v "^$"
+            
+            # Store metrics for tracking
+            echo "::set-output name=images_removed::$IMAGES_REMOVED"
+            echo "::set-output name=disk_space_after::$AFTER_SPACE"

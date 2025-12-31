@@ -1,0 +1,372 @@
+name: Build and Deploy to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        type: environment
+        default: production
+
+# Concurrency control to prevent overlapping deployments
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permissions needed for GitHub Actions
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+# Set environment variables for the workflow
+env:
+  ECR_REPOSITORY: robotics-server
+  BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+
+jobs:
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        run: npm audit --production --audit-level=high
+        continue-on-error: true
+
+      - name: Run ESLint
+        run: |
+          npm run lint || echo "Linting issues found, but continuing..."
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+  build:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: security
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: "--debug"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,format=long,prefix=commit-
+            type=ref,event=branch
+            type=raw,value=latest
+            type=raw,value=${{ github.run_number }}
+
+      - name: Calculate cache key
+        id: cache-key
+        run: |
+          echo "hash=$(sha256sum package-lock.json | cut -d ' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            NODE_ENV=production
+            BUILD_NUMBER=${{ github.run_number }}
+            COMMIT_SHA=${{ github.sha }}
+
+      - name: Move Docker cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Scan Docker image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:commit-${{ github.sha }}
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: 'CRITICAL,HIGH'
+          timeout: '10m'
+          exit-code: '0'
+
+      - name: Archive Trivy scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-scan-results
+          path: trivy-results.txt
+          retention-days: 7
+
+      - name: Clean up old ECR images
+        if: success()
+        run: |
+          echo "Cleaning up old images from ECR..."
+          REPO=${{ env.ECR_REPOSITORY }}
+          ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          CURRENT_DIGEST=$(aws ecr describe-images \
+            --repository-name $REPO \
+            --image-ids imageTag=commit-${{ github.sha }} \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo "none")
+          if [ "$CURRENT_DIGEST" == "none" ]; then
+            echo "Warning: Could not find current image digest."
+          else
+            echo "Current image digest: $CURRENT_DIGEST"
+          fi
+          IMAGE_DIGESTS=$(aws ecr describe-images \
+            --repository-name $REPO \
+            --query 'sort_by(imageDetails,& imagePushedAt)[*].imageDigest' \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$IMAGE_DIGESTS" ]; then
+            echo "Could not retrieve ECR image information. Skipping cleanup."
+            exit 0
+          fi
+          IFS=$'\t' read -r -a IMAGE_DIGESTS_ARR <<< "$IMAGE_DIGESTS"
+          TOTAL=${#IMAGE_DIGESTS_ARR[@]}
+          TO_KEEP=5
+          if [ $TOTAL -gt $TO_KEEP ]; then
+            TO_REMOVE=$((TOTAL - TO_KEEP))
+            echo "Found $TOTAL images, removing $TO_REMOVE old images."
+            for ((i=0; i<$TO_REMOVE; i++)); do
+              DIGEST=${IMAGE_DIGESTS_ARR[$i]}
+              if [ -n "$CURRENT_DIGEST" ] && [ "$DIGEST" == "$CURRENT_DIGEST" ]; then
+                echo "Skipping current image: $DIGEST"
+                continue
+              fi
+              aws ecr batch-delete-image \
+                --repository-name $REPO \
+                --image-ids imageDigest=$DIGEST >/dev/null 2>&1
+            done
+          else
+            echo "Only $TOTAL images found, keeping all."
+          fi
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Create deployment script on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            mkdir -p /home/ubuntu/robotics-deploy
+            echo "Using direct Docker commands"
+            mkdir -p /home/ubuntu/robotics-deploy/cache
+            cat > /home/ubuntu/robotics-deploy/start-container.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            source .env
+            docker stop robotics-server-container 2>/dev/null || true
+            docker rm robotics-server-container 2>/dev/null || true
+            if [ -z "${ECR_REGISTRY}" ] || [ -z "${ECR_REPOSITORY}" ] || [ -z "${IMAGE_TAG}" ]; then
+              echo "Error: Missing required environment variables."
+              exit 1
+            fi
+            docker run -d \
+              --name robotics-server-container \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e DB_USER="${DB_USER}" \
+              -e DB_HOST="${DB_HOST}" \
+              -e DB_DATABASE="${DB_DATABASE}" \
+              -e DB_PASSWORD="${DB_PASSWORD}" \
+              -e DB_PORT="${DB_PORT}" \
+              -e SSL="${SSL}" \
+              -e JWT_SECRET="${JWT_SECRET}" \
+              -e JWT_EXPIRATION="${JWT_EXPIRATION}" \
+              -e PORT="${PORT}" \
+              -e NODE_ENV="${NODE_ENV}" \
+              -e CORS_ORIGIN="${CORS_ORIGIN}" \
+              -e COMPILATION_CACHE_SIZE=100 \
+              -e COMPILATION_CACHE_TTL=3600 \
+              -e OPTIMIZE_COMPILATION=true \
+              -e COMPILATION_THREADS=2 \
+              -v "$(pwd)/cache:/usr/src/app/cache" \
+              --security-opt no-new-privileges:true \
+              --user node \
+              --health-cmd "curl -f http://localhost:3000/health || wget -q --spider http://localhost:3000/health || exit 1" \
+              --health-interval=15s \
+              --health-timeout=15s \
+              --health-retries=5 \
+              --health-start-period=30s \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --cpus=1 \
+              --memory=1g \
+              ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+            EOF
+            chmod +x /home/ubuntu/robotics-deploy/start-container.sh
+            cat /home/ubuntu/robotics-deploy/start-container.sh
+
+      - name: Deploy to EC2 with Docker commands
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            export IMAGE_TAG=commit-${{ github.sha }}
+            export ECR_REPOSITORY=robotics-server
+            export ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+            docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            echo "DB_USER=${{ secrets.DB_USER }}" > /home/ubuntu/robotics-deploy/.env
+            echo "DB_HOST=${{ secrets.DB_HOST }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_DATABASE=${{ secrets.DB_DATABASE }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "DB_PORT=${{ secrets.DB_PORT }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "SSL=${{ secrets.SSL }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "JWT_EXPIRATION=${{ secrets.JWT_EXPIRATION }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "PORT=${{ secrets.PORT }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "NODE_ENV=${{ secrets.NODE_ENV }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}" >> /home/ubuntu/robotics-deploy/.env
+            echo "ECR_REGISTRY=$ECR_REGISTRY" >> /home/ubuntu/robotics-deploy/.env
+            echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> /home/ubuntu/robotics-deploy/.env
+            echo "IMAGE_TAG=$IMAGE_TAG" >> /home/ubuntu/robotics-deploy/.env
+
+            cd /home/ubuntu/robotics-deploy
+            bash -x ./start-container.sh
+            sleep 5
+
+            echo "Cleaning unused Docker resources..."
+            CURRENT_IMAGE_ID=$(docker inspect $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f '{{.Id}}')
+            docker container prune -f
+            docker image prune -f
+            for img in $(docker images --format "{{.ID}}" | grep $ECR_REPOSITORY); do
+              if [ "$img" != "$CURRENT_IMAGE_ID" ]; then
+                docker rmi -f $img || true
+              fi
+            done
+            docker image prune -a -f --filter "until=24h"
+            docker volume prune -f
+            docker network prune -f
+            df -h
+
+      - name: Verify Deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Wait for container to be healthy with a progress indicator
+            attempts=0
+            max_attempts=20  # Increased from 10 to 20
+            interval=15      # Increased from 5 to 15 seconds
+            echo "Checking container health status..."
+            
+            # First, make sure the container is running
+            if [ "$(docker inspect --format='{{.State.Status}}' robotics-server-container 2>/dev/null)" != "running" ]; then
+              echo "❌ Container is not running. Checking logs..."
+              docker logs robotics-server-container
+              exit 1
+            fi
+            
+            echo "✅ Container is running. Waiting for it to become healthy..."
+            
+            # Check directly with curl for more diagnostic information
+            curl -v http://localhost:3000/health || true
+            
+            until [ "$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null)" == "healthy" ] || [ $attempts -eq $max_attempts ]; do
+              attempts=$((attempts+1))
+              progress=$(printf '%*s' $attempts | tr ' ' '#')
+              empty=$(printf '%*s' $((max_attempts - attempts)) | tr ' ' '.')
+              echo -ne "Waiting for container to be healthy [$progress$empty] ($attempts/$max_attempts)\r"
+              sleep $interval
+              
+              # At regular intervals, check health and logs
+              if [ $((attempts % 5)) -eq 0 ]; then
+                echo -e "\nContainer status at attempt $attempts:"
+                docker inspect --format='{{.State.Status}}' robotics-server-container
+                health_status=$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null || echo "No health data yet")
+                echo "Health status: $health_status"
+                
+                # Try a direct curl to see what's happening
+                echo "Direct health check:"
+                curl -v http://localhost:3000/health || true
+                
+                echo "Recent container logs:"
+                docker logs --tail 20 robotics-server-container
+              fi
+            done
+            
+            if [ "$(docker inspect --format='{{.State.Health.Status}}' robotics-server-container 2>/dev/null)" != "healthy" ]; then
+              echo "❌ Container failed to become healthy. Deployment failed."
+              echo "Testing health endpoint directly:"
+              curl -v http://localhost:3000/health || echo "Health endpoint test failed"
+              docker logs --tail 50 robotics-server-container
+              exit 1
+            fi
+
+            echo "✅ Deployment successful. Container is healthy."
+            docker ps
+            docker stats robotics-server-container --no-stream
+            df -h
+            docker images | grep robotics-server || true

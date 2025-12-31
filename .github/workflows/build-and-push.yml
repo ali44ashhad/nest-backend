@@ -1,0 +1,195 @@
+name: Build and Push to ECR
+
+on:
+  workflow_call:  # Allows this workflow to be called from other workflows
+  workflow_dispatch:  # Allows manual triggering
+  
+# Concurrency control to prevent overlapping operations
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permissions needed for GitHub Actions with AWS
+permissions:
+  id-token: write
+  contents: read
+  actions: write  # Required for uploading artifacts
+
+# Set environment variables for the workflow
+env:
+  ECR_REPOSITORY: robotics-server
+  BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      build_push_duration: ${{ steps.metrics.outputs.build_push_duration }}
+      image_size_mb: ${{ steps.metrics.outputs.image_size_mb }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Shallow clone for faster checkout
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: "--debug"
+          
+      - name: Install Trivy scanner
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.48.0
+          trivy --version
+
+      # Record start time for metrics
+      - name: Record start time
+        id: start-time
+        run: |
+          echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
+
+      # Enhanced caching based on both package-lock.json and Dockerfile
+      - name: Calculate cache key
+        id: cache-key
+        run: |
+          PACKAGE_HASH=$(sha256sum package-lock.json | cut -d ' ' -f1)
+          DOCKERFILE_HASH=$(sha256sum Dockerfile | cut -d ' ' -f1)
+          COMBINED_HASH="${PACKAGE_HASH}_${DOCKERFILE_HASH}"
+          echo "hash=$COMBINED_HASH" >> $GITHUB_OUTPUT
+          echo "Cache key generated from package-lock.json and Dockerfile: $COMBINED_HASH"
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+            
+      # Prepare tag list for Docker build
+      - name: Prepare ECR image tags
+        id: prepare-tags
+        run: |
+          ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          
+          # Create tags array
+          TAGS=(
+            "${ECR_REGISTRY}/${ECR_REPOSITORY}:commit-${{ github.sha }}"
+            "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+            "${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ github.run_number }}"
+          )
+          
+          # Add main tag if on main branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAGS+=("${ECR_REGISTRY}/${ECR_REPOSITORY}:main")
+          fi
+          
+          # Create a comma-separated list for Docker build action
+          IFS=,
+          TAGS_STRING="${TAGS[*]}"
+          echo "tags=$TAGS_STRING" >> $GITHUB_OUTPUT
+          echo "Prepared tags: $TAGS_STRING"
+
+      # Build and push the Docker image directly to ECR in one step
+      - name: Build and Push Docker Image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true  # Push directly to registry
+          tags: ${{ steps.prepare-tags.outputs.tags }}
+          cache-from: |
+            type=local,src=/tmp/.buildx-cache
+            type=gha,scope=${{ github.workflow }}
+          cache-to: |
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+            type=gha,scope=${{ github.workflow }},mode=max
+          build-args: |
+            NODE_ENV=production
+            BUILD_NUMBER=${{ github.run_number }}
+            COMMIT_SHA=${{ github.sha }}
+            BUILDKIT_INLINE_CACHE=1
+          platforms: linux/amd64
+          no-cache-filters: |
+            node_modules
+          labels: |
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.run_number }}
+
+      # Move cache for next build (prevents unbounded cache growth)
+      - name: Move Docker cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Scan the pushed image for vulnerabilities
+      - name: Scan pushed image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:commit-${{ github.sha }}
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: 'CRITICAL,HIGH'
+          timeout: '10m'
+          exit-code: '0'  # Don't fail the build
+
+      # Upload scan results
+      - name: Archive Trivy scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-results
+          path: trivy-results.txt
+          retention-days: 7
+          
+      # Record metrics about the build and push operation
+      - name: Record metrics
+        id: metrics
+        run: |
+          # Calculate duration
+          END_TIME=$(date +%s)
+          START_TIME=${{ steps.start-time.outputs.start_time }}
+          DURATION=$((END_TIME - START_TIME))
+          
+          echo "Successfully built and pushed image to ECR"
+          echo "build_push_duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "Build and push completed in $DURATION seconds"
+          
+          # Get image details using aws cli
+          ECR_REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_DETAILS=$(aws ecr describe-images --repository-name ${ECR_REPOSITORY} --image-ids imageTag=commit-${{ github.sha }} --query 'imageDetails[0].[imageSizeInBytes]' --output text)
+          
+          if [ -n "$IMAGE_DETAILS" ]; then
+            IMAGE_SIZE_MB=$((IMAGE_DETAILS / 1024 / 1024))
+            echo "image_size_mb=$IMAGE_SIZE_MB" >> $GITHUB_OUTPUT
+            echo "Image size: $IMAGE_SIZE_MB MB"
+          fi
+          
+      # Add summary for GitHub workflow
+      - name: Add build and push summary
+        run: |
+          echo "## 🚀 Build and Push Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏱️ Duration: ${{ steps.metrics.outputs.build_push_duration }} seconds" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 Image Size: ${{ steps.metrics.outputs.image_size_mb }} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏷️ Tags: commit-${{ github.sha }}, latest, ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "  - main" >> $GITHUB_STEP_SUMMARY
+          fi
